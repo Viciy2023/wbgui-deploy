@@ -1,0 +1,5 @@
+﻿# 构建产物 / 临时文件
+*.tmp
+.DS_Store
+
+# GitHub Actions 会在运行时同步上游 README 与 last-build.txt

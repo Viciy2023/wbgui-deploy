@@ -1,0 +1,148 @@
+name: Sync & Build workbuddy2api-gui
+
+on:
+  schedule:
+    # 每 12 小时一次；UTC 00/12 = 北京 08/20 点
+    - cron: '0 0,12 * * *'
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: 287775856/workbuddy2api-gui
+  UPSTREAM_BRANCH: master
+  IMAGE_NAME: ghcr.io/viciy2023/wbgui-deploy
+  # 构建修订号：仅当下游构建逻辑（Dockerfile 补丁、构建参数）变化时递增。
+  # 它参与 last-build.txt 的指纹比对，因此改这里即可强制重建一次，
+  # 无需等上游出新提交。当前 v1 = 初版（直构上游 Dockerfile，无补丁）。
+  BUILD_REV: v1
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+      upstream_sha: ${{ steps.compare.outputs.upstream_sha }}
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream README
+        run: |
+          gh api repos/${{ env.UPSTREAM_REPO }}/contents/README.md \
+            --jq '.content' | base64 -d > README.md
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          if git diff --staged --quiet; then
+            echo "README unchanged."
+          else
+            git commit -m "docs: sync upstream README"
+            git pull --rebase origin main
+            git push
+            echo "README synced."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get upstream latest SHA
+        id: compare
+        run: |
+          UPSTREAM_SHA=$(gh api repos/${{ env.UPSTREAM_REPO }}/commits/${{ env.UPSTREAM_BRANCH }} --jq '.sha')
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          # last-build.txt 格式：<upstream_sha><build_rev>（旧格式只有 sha，会被视为变化并补建一次）
+          LAST_LINE=$(cat last-build.txt 2>/dev/null | tr -d '[:space:]' || echo "")
+          echo "last_fp=$LAST_LINE"
+          WANT_FP="${UPSTREAM_SHA}${BUILD_REV}"
+          echo "want_fp=$WANT_FP"
+          if [ "$WANT_FP" = "$LAST_LINE" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No change detected (upstream ${UPSTREAM_SHA} + ${BUILD_REV}), skipping build."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Change detected: ${LAST_LINE:-<empty>} -> $WANT_FP"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 只取上游源码；GUI 的 Dockerfile 自带完整多阶段构建（node 前端 + go 后端），
+      # 无需任何补丁，直接以 ./upstream 作为构建上下文。
+      - name: Clone upstream source
+        run: |
+          git clone --depth 1 --branch ${{ env.UPSTREAM_BRANCH }} https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
+          echo "--- upstream tip ---"
+          git -C upstream log --oneline -1
+          echo "--- Dockerfile sanity (expect node+go stages) ---"
+          grep -nE '^FROM |^COPY --from=web' upstream/Dockerfile || true
+
+      # 硬校验：Dockerfile 必须存在，且含前端构建阶段的产物拷贝。
+      # 上游若重构 Dockerfile 导致结构变化，宁可构建失败留旧镜像，
+      # 也不要静默产出无法 embed 前端的空壳镜像。
+      - name: Verify Dockerfile shape
+        run: |
+          set -euo pipefail
+          DF=upstream/Dockerfile
+          [ -f "$DF" ] || { echo "::error::upstream/Dockerfile missing"; exit 1; }
+          if ! grep -qE '^COPY --from=web .*internal/webui/dist' "$DF"; then
+            echo "::error::Dockerfile no longer copies web stage into internal/webui/dist — structure changed, review required."
+            cat "$DF"
+            exit 1
+          fi
+          echo "Dockerfile shape OK."
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 前端 npm 构建较慢，用 GHCR 本地缓存层跨次复用（同 tag 前缀）。
+      # 仅缓存导出/导入，不改变镜像内容。
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./upstream
+          push: true
+          build-args: |
+            VERSION=${{ needs.check.outputs.upstream_sha }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ needs.check.outputs.upstream_sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Record built fingerprint
+        run: |
+          echo "${{ needs.check.outputs.upstream_sha }}${BUILD_REV}" > last-build.txt
+
+      - name: Commit last-build.txt
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last-build.txt
+          if git diff --staged --quiet; then
+            echo "No change to commit."
+          else
+            git commit -m "build: ${{ needs.check.outputs.upstream_sha }} ${BUILD_REV}"
+            git pull --rebase origin main
+            git push
+          fi
