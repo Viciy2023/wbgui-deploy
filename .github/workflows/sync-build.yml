@@ -21,7 +21,8 @@ env:
   # 构建修订号：仅当下游构建逻辑（Dockerfile 补丁、构建参数）变化时递增。
   # 它参与 last-build.txt 的指纹比对，因此改这里即可强制重建一次，
   # 无需等上游出新提交。当前 v1 = 初版（直构上游 Dockerfile，无补丁）。
-  BUILD_REV: v1
+  BUILD_REV: v2
+  # 递增说明：构建产物增加了 Docker Hub 目标（ccy2026/wbgui）。
 
 jobs:
   check:
