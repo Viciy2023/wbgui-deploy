@@ -1,5 +1,11 @@
 name: Sync & Build workbuddy2api-gui
 
+# 从上游 clone 源码后自己构建，推送两个 registry：
+#   ghcr.io/viciy2023/wbgui-deploy     —— GHCR，备用通道
+#   ccy2026/workbuddy2api-gui          —— Docker Hub，飞牛实际拉取的那条
+#
+# 命名跟惯例对齐：<用户名>/<镜像名>:<标签>，一个服务占一个仓库。
+
 on:
   schedule:
     # 每 12 小时一次；UTC 00/12 = 北京 08/20 点
@@ -10,6 +16,8 @@ env:
   UPSTREAM_REPO: 287775856/workbuddy2api-gui
   UPSTREAM_BRANCH: master
   IMAGE_NAME: ghcr.io/viciy2023/wbgui-deploy
+  # Docker Hub 上的仓库名。完整镜像名是 <DOCKERHUB_USERNAME>/workbuddy2api-gui。
+  DOCKERHUB_REPO: workbuddy2api-gui
   # 构建修订号：仅当下游构建逻辑（Dockerfile 补丁、构建参数）变化时递增。
   # 它参与 last-build.txt 的指纹比对，因此改这里即可强制重建一次，
   # 无需等上游出新提交。当前 v1 = 初版（直构上游 Dockerfile，无补丁）。
@@ -52,7 +60,6 @@ jobs:
         run: |
           UPSTREAM_SHA=$(gh api repos/${{ env.UPSTREAM_REPO }}/commits/${{ env.UPSTREAM_BRANCH }} --jq '.sha')
           echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
-          # last-build.txt 格式：<upstream_sha><build_rev>（旧格式只有 sha，会被视为变化并补建一次）
           LAST_LINE=$(cat last-build.txt 2>/dev/null | tr -d '[:space:]' || echo "")
           echo "last_fp=$LAST_LINE"
           WANT_FP="${UPSTREAM_SHA}${BUILD_REV}"
@@ -105,6 +112,23 @@ jobs:
           fi
           echo "Dockerfile shape OK."
 
+      # 先算出要推的标签：Docker Hub 凭据没配时就不含它，避免登录失败把构建拖垮。
+      - name: 组装推送目标
+        id: tags
+        run: |
+          SHA="${{ needs.check.outputs.upstream_sha }}"
+          TAGS="${IMAGE_NAME}:latest,${IMAGE_NAME}:${SHA}"
+          if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ] && [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            DEST="docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${DOCKERHUB_REPO}"
+            TAGS="${TAGS},${DEST}:latest,${DEST}:${SHA}"
+            echo "hub=true" >> "$GITHUB_OUTPUT"
+            echo "Docker Hub 凭据已配置，将同时推送 ${DEST}。"
+          else
+            echo "hub=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 Docker Hub 凭据，本次只推送 GHCR。"
+          fi
+          echo "value=${TAGS}" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -112,10 +136,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        if: steps.tags.outputs.hub == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 前端 npm 构建较慢，用 GHCR 本地缓存层跨次复用（同 tag 前缀）。
+      # 前端 npm 构建较慢，用 GHCR 本地缓存层跨次复用（含 tag 前缀）。
       # 仅缓存导出/导入，不改变镜像内容。
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -124,9 +155,7 @@ jobs:
           push: true
           build-args: |
             VERSION=${{ needs.check.outputs.upstream_sha }}
-          tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ needs.check.outputs.upstream_sha }}
+          tags: ${{ steps.tags.outputs.value }}
           cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
 
